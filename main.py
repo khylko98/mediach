@@ -1,12 +1,15 @@
 import os
 import re
 import sys
+import time
+from typing import Iterable, Optional, Set
 from urllib.parse import urljoin
 
 import httpx
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
-# Regex to validate 2ch / arhivach threads URLs
+# ---------------------- CONSTANTS ----------------------
+
 VALID_THREAD_URL = re.compile(
     r"^https?://(?:"
     r"2ch\.[a-z]{2,5}/[a-z]+/res/\d+\.html"
@@ -21,104 +24,153 @@ MEDIA_EXTENSIONS = {
 }
 MEDIA_EXTENSIONS["both"] = MEDIA_EXTENSIONS["image"] + MEDIA_EXTENSIONS["video"]
 
+THREAD_FOLDER_NAME_REGEX = re.compile(r"/(\d+)(?:\.html)?(?:#.*)?/?$")
 
-def extract_href(tag) -> str | None:
+
+# ---------------------- UTILITIES ----------------------
+
+
+def extract_href(tag: Tag) -> Optional[str]:
+    """Safely extract an href attribute from a BeautifulSoup tag."""
     href = tag.get("href")
 
-    # Normal case: string
     if isinstance(href, str):
         return href
 
-    # Case: ["url.jpg"]
     if isinstance(href, list) and len(href) == 1 and isinstance(href[0], str):
         return href[0]
 
     return None
 
 
-def get_media_links(thread_url: str, media_option: str) -> set[str] | None:
-    """Fetch thread HTML and extract media links based on extension."""
+def fetch_html(client: httpx.Client, url: str) -> Optional[str]:
+    """Download page HTML or return None on failure."""
     try:
-        response = httpx.get(thread_url, verify=False)
+        response = client.get(url)
         response.raise_for_status()
-    except httpx.RequestError as e:
-        print(f"Request error for {thread_url}: {e}")
-        return None
-    except httpx.HTTPStatusError as e:
-        print(f"HTTP {e.response.status_code} for {thread_url}")
+        return response.text
+    except httpx.HTTPError as e:
+        print(f"[ERROR] Failed to fetch {url}: {e}")
         return None
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    valid_extensions = MEDIA_EXTENSIONS[media_option]
 
-    media_links: set[str] = set()
+def get_media_links(html: str, base_url: str, extensions: Iterable[str]) -> Set[str]:
+    """Parse all media links from HTML."""
+    soup = BeautifulSoup(html, "html.parser")
+    media_links: Set[str] = set()
 
     for tag in soup.find_all("a", href=True):
         href = extract_href(tag)
         if not href:
             continue
 
-        if any(href.lower().endswith(ext) for ext in valid_extensions):
-            media_links.add(urljoin(thread_url, href))
+        href_lower = href.lower()
+        if any(href_lower.endswith(ext) for ext in extensions):
+            media_links.add(urljoin(base_url, href))
 
     return media_links
 
 
-def main():
+def extract_thread_id(url: str) -> Optional[str]:
+    """Extract only the thread numeric ID for folder name."""
+    match = THREAD_FOLDER_NAME_REGEX.search(url)
+    return match.group(1) if match else None
+
+
+def download_file(client: httpx.Client, url: str, dest_path: str) -> None:
+    """Download a file to a specific path."""
+    try:
+        with client.stream("GET", url) as resp:
+            resp.raise_for_status()
+
+            with open(dest_path, "wb") as f:
+                for chunk in resp.iter_bytes():
+                    f.write(chunk)
+
+        print(f"✓ Saved: {url}")
+    except httpx.HTTPError as e:
+        print(f"[ERROR] Failed to download {url}: {e}")
+
+
+# ---------------------- MAIN LOGIC ----------------------
+
+
+def process_thread(
+    client: httpx.Client, thread_url: str, output_root: str, media_option: str
+) -> None:
+    html = fetch_html(client, thread_url)
+    if not html:
+        print(f"[WARN] Skipping unreachable thread: {thread_url}")
+        return
+
+    extensions = MEDIA_EXTENSIONS[media_option]
+    media_links = get_media_links(html, thread_url, extensions)
+
+    if not media_links:
+        print(f"[WARN] No media found in: {thread_url}")
+        return
+
+    print(f"[OK] Found {len(media_links)} media files in {thread_url}")
+
+    thread_id = extract_thread_id(thread_url)
+    if not thread_id:
+        print(f"[WARN] Cannot extract folder name from URL: {thread_url}")
+        return
+
+    thread_folder = os.path.join(output_root, thread_id)
+    os.makedirs(thread_folder, exist_ok=True)
+
+    for media_link in media_links:
+        filename = media_link.rsplit("/", 1)[-1]
+        file_path = os.path.join(thread_folder, filename)
+        download_file(client, media_link, file_path)
+
+
+def parse_args() -> tuple[str, str, list[str]]:
+    """Validate CLI arguments and return parsed values."""
     if len(sys.argv) < 4:
         print(
-            "Usage: "
-            "python "
-            "main.py "
-            "<output_path> "
-            "<image | video | both> "
-            "[<thread_url_1> <thread_url_2> ...]\n"
-            #
-            "Example: "
-            "python3.14 "
-            "main.py "
-            "~/Downloads "
-            "both "
-            "https://2ch.hk/b/res/322069228.html "
-            "https://arhivach.vc/thread/1222099/"
+            "Usage:\n  python main.py <output_path> <image|video|both> <thread_url...>"
         )
         sys.exit(1)
 
-    output_path = sys.argv[1]
+    out_path = sys.argv[1]
+    option = sys.argv[2].lower()
+    urls = sys.argv[3:]
 
-    # Ensure output path exists
-    if not os.path.isdir(output_path):
-        print(
-            f"Error: '{output_path}' does not exist or is not a directory.\n"
-            "Please create the folder first or specify an existing path."
-        )
+    if not os.path.isdir(out_path):
+        print(f"Error: '{out_path}' is not an existing directory.")
         sys.exit(1)
 
-    media_option = sys.argv[2]
-
-    if media_option not in ("image", "video", "both"):
-        print("Error: media option must be one of: image, video, both\n")
+    if option not in MEDIA_EXTENSIONS:
+        print("Error: media option must be: image, video, both")
         sys.exit(1)
 
-    threads_urls = sys.argv[3:]
+    valid_urls = [u for u in urls if VALID_THREAD_URL.match(u)]
+    invalid_urls = [u for u in urls if u not in valid_urls]
 
-    valid_threads_urls: set[str] = set()
+    for bad in invalid_urls:
+        print(f"Incorrect URL: {bad}")
 
-    for thread_url in threads_urls:
-        # Check if the URL is valid according to VALID_THREAD_URL
-        if VALID_THREAD_URL.match(thread_url):
-            valid_threads_urls.add(thread_url)
-        else:
-            print(f"Incorrect URL: {thread_url}")
-
-    if not valid_threads_urls:
-        print("Error: No valid threads URLs provided.")
+    if not valid_urls:
+        print("Error: No valid thread URLs provided.")
         sys.exit(1)
 
-    for valid_thread_url in valid_threads_urls:
-        media_links = get_media_links(valid_thread_url, media_option)
-        print(media_links)
+    return out_path, option, valid_urls
 
+
+def main():
+    out_path, option, thread_urls = parse_args()
+
+    # One shared client — faster and cleaner
+    with httpx.Client(verify=False, timeout=30.0) as client:
+        for url in thread_urls:
+            process_thread(client, url, out_path, option)
+
+
+# ---------------------- ENTRY POINT ----------------------
 
 if __name__ == "__main__":
+    start = time.perf_counter()
     main()
+    print(f"\nTime: {time.perf_counter() - start:.2f} seconds.")

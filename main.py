@@ -172,5 +172,15 @@ def main():
 
 if __name__ == "__main__":
     start = time.perf_counter()
-    main()
-    print(f"\nTime: {time.perf_counter() - start:.2f} seconds.")
+
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted by user (Ctrl+C).")
+    except Exception:
+        import traceback
+
+        print(traceback.format_exc())
+        sys.exit(1)
+    finally:
+        print(f"Time: {time.perf_counter() - start:.2f} seconds.")
